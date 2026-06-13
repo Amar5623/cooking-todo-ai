@@ -1,12 +1,23 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest } from "next/server";
 import { generateDayPlan, PlannerInput } from "@/lib/mealPlanner";
 import { buildGroceryList, totalGroceryCost } from "@/lib/groceryList";
 import { buildSubstitutions } from "@/lib/substitutions";
 import { evaluateBudget } from "@/lib/budget";
-import { generateSummary } from "@/lib/llm";
+import {
+  callGroqStream,
+  callGeminiStream,
+  fallbackSummary,
+  SummaryInput,
+} from "@/lib/llm";
 import { DietTag, MealType } from "@/lib/data";
 
-const VALID_DIETS: DietTag[] = ["veg", "vegan", "non-veg", "gluten-free", "dairy-free"];
+const VALID_DIETS: DietTag[] = [
+  "veg",
+  "vegan",
+  "non-veg",
+  "gluten-free",
+  "dairy-free",
+];
 const VALID_MEAL_TYPES: MealType[] = ["breakfast", "lunch", "dinner"];
 
 interface RequestBody {
@@ -17,34 +28,60 @@ interface RequestBody {
   pantry?: string[];
 }
 
-function validateBody(body: unknown): { valid: true; data: RequestBody } | { valid: false; error: string } {
+function validateBody(
+  body: unknown
+):
+  | { valid: true; data: RequestBody }
+  | { valid: false; error: string } {
   if (typeof body !== "object" || body === null) {
     return { valid: false, error: "Request body must be a JSON object." };
   }
 
   const b = body as Record<string, unknown>;
 
-  if (typeof b.dietPreference !== "string" || !VALID_DIETS.includes(b.dietPreference as DietTag)) {
-    return { valid: false, error: `dietPreference must be one of: ${VALID_DIETS.join(", ")}` };
+  if (
+    typeof b.dietPreference !== "string" ||
+    !VALID_DIETS.includes(b.dietPreference as DietTag)
+  ) {
+    return {
+      valid: false,
+      error: `dietPreference must be one of: ${VALID_DIETS.join(", ")}`,
+    };
   }
 
-  if (typeof b.budget !== "number" || b.budget <= 0 || !Number.isFinite(b.budget)) {
+  if (
+    typeof b.budget !== "number" ||
+    b.budget <= 0 ||
+    !Number.isFinite(b.budget)
+  ) {
     return { valid: false, error: "budget must be a positive number." };
   }
 
   if (
     !Array.isArray(b.mealsNeeded) ||
     b.mealsNeeded.length === 0 ||
-    !b.mealsNeeded.every((m) => typeof m === "string" && VALID_MEAL_TYPES.includes(m as MealType))
+    !b.mealsNeeded.every(
+      (m) => typeof m === "string" && VALID_MEAL_TYPES.includes(m as MealType)
+    )
   ) {
-    return { valid: false, error: `mealsNeeded must be a non-empty array containing only: ${VALID_MEAL_TYPES.join(", ")}` };
+    return {
+      valid: false,
+      error: `mealsNeeded must be a non-empty array containing only: ${VALID_MEAL_TYPES.join(", ")}`,
+    };
   }
 
-  if (b.avoid !== undefined && (!Array.isArray(b.avoid) || !b.avoid.every((a) => typeof a === "string"))) {
+  if (
+    b.avoid !== undefined &&
+    (!Array.isArray(b.avoid) || !b.avoid.every((a) => typeof a === "string"))
+  ) {
     return { valid: false, error: "avoid must be an array of strings." };
   }
 
-  if (b.pantry !== undefined && (!Array.isArray(b.pantry) || !b.pantry.every((p) => typeof p === "string"))) {
+  if (
+    b.pantry !== undefined &&
+    (!Array.isArray(b.pantry) ||
+      !b.pantry.every((p) => typeof p === "string"))
+  ) {
     return { valid: false, error: "pantry must be an array of strings." };
   }
 
@@ -60,20 +97,50 @@ function validateBody(body: unknown): { valid: true; data: RequestBody } | { val
   };
 }
 
+/**
+ * POST /api/plan
+ *
+ * Streams a newline-delimited JSON protocol:
+ *   1. One "data" event with the full structured plan (plan, groceryList,
+ *      groceryTotal, substitutions, budget).
+ *   2. Many "chunk" events each carrying a string fragment of the AI summary.
+ *   3. One "done" event with the summary source ("groq" | "gemini" | "fallback").
+ *
+ * Each line is a JSON object: { type: string; payload: unknown }
+ */
 export async function POST(req: NextRequest) {
   let body: unknown;
   try {
     body = await req.json();
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+    return new Response(
+      JSON.stringify({ error: "Invalid JSON body." }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
+    );
   }
 
   const validation = validateBody(body);
   if (!validation.valid) {
-    return NextResponse.json({ error: validation.error }, { status: 400 });
+    return new Response(
+      JSON.stringify({ error: validation.error }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
+    );
   }
 
-  const { dietPreference, budget, mealsNeeded, avoid = [], pantry = [] } = validation.data;
+  const {
+    dietPreference,
+    budget,
+    mealsNeeded,
+    avoid = [],
+    pantry = [],
+  } = validation.data;
+
+  // ── Deterministic core logic ──────────────────────────────────────────────
+  let planData: ReturnType<typeof evaluateBudget> & {
+    groceryList: ReturnType<typeof buildGroceryList>;
+    groceryTotal: number;
+    substitutions: ReturnType<typeof buildSubstitutions>;
+  };
 
   try {
     const normalizedAvoid = avoid.map((a) => a.toLowerCase().trim());
@@ -103,24 +170,127 @@ export async function POST(req: NextRequest) {
       pantry: normalizedPantry,
     });
 
-    const summary = await generateSummary({
-      plan: finalPlan,
-      groceryItems,
-      substitutions,
-      budgetResult,
-    });
-
-    return NextResponse.json({
-      plan: finalPlan,
+    planData = {
+      ...budgetResult,
       groceryList: groceryItems,
       groceryTotal: totalGroceryCost(groceryItems),
       substitutions,
-      budget: budgetResult,
-      summary: summary.text,
-      summarySource: summary.source,
-    });
+    };
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Unexpected error generating plan.";
-    return NextResponse.json({ error: message }, { status: 422 });
+    const message =
+      err instanceof Error
+        ? err.message
+        : "Unexpected error generating plan.";
+    return new Response(
+      JSON.stringify({ error: message }),
+      { status: 422, headers: { "Content-Type": "application/json" } }
+    );
   }
+
+  // ── Build summary input ───────────────────────────────────────────────────
+  const summaryInput: SummaryInput = {
+    plan: planData.finalPlan,
+    groceryItems: planData.groceryList,
+    substitutions: planData.substitutions,
+    budgetResult: {
+      estimatedCost: planData.estimatedCost,
+      budget: planData.budget,
+      feasible: planData.feasible,
+      difference: planData.difference,
+      swapsApplied: planData.swapsApplied,
+      finalPlan: planData.finalPlan,
+      message: planData.message,
+    },
+  };
+
+  // ── Stream response ───────────────────────────────────────────────────────
+  const encoder = new TextEncoder();
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      // 1. Send structured plan data first
+      const dataEvent = {
+        type: "data",
+        payload: {
+          plan: planData.finalPlan,
+          groceryList: planData.groceryList,
+          groceryTotal: planData.groceryTotal,
+          substitutions: planData.substitutions,
+          budget: {
+            estimatedCost: planData.estimatedCost,
+            budget: planData.budget,
+            feasible: planData.feasible,
+            difference: planData.difference,
+            swapsApplied: planData.swapsApplied,
+            message: planData.message,
+          },
+        },
+      };
+      controller.enqueue(
+        encoder.encode(JSON.stringify(dataEvent) + "\n")
+      );
+
+      // 2. Try streaming AI summary
+      let summarySource: "groq" | "gemini" | "fallback" = "fallback";
+
+      const groqStream = await callGroqStream(summaryInput);
+      if (groqStream) {
+        summarySource = "groq";
+        const reader = groqStream.getReader();
+        const dec = new TextDecoder();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = dec.decode(value, { stream: true });
+          controller.enqueue(
+            encoder.encode(
+              JSON.stringify({ type: "chunk", payload: chunk }) + "\n"
+            )
+          );
+        }
+      } else {
+        const geminiStream = await callGeminiStream(summaryInput);
+        if (geminiStream) {
+          summarySource = "gemini";
+          const reader = geminiStream.getReader();
+          const dec = new TextDecoder();
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const chunk = dec.decode(value, { stream: true });
+            controller.enqueue(
+              encoder.encode(
+                JSON.stringify({ type: "chunk", payload: chunk }) + "\n"
+              )
+            );
+          }
+        } else {
+          // Deterministic fallback — send as a single chunk
+          const text = fallbackSummary(summaryInput);
+          controller.enqueue(
+            encoder.encode(
+              JSON.stringify({ type: "chunk", payload: text }) + "\n"
+            )
+          );
+        }
+      }
+
+      // 3. Signal completion
+      controller.enqueue(
+        encoder.encode(
+          JSON.stringify({ type: "done", payload: summarySource }) + "\n"
+        )
+      );
+      controller.close();
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Transfer-Encoding": "chunked",
+      "X-Content-Type-Options": "nosniff",
+      "Cache-Control": "no-store",
+    },
+  });
 }
